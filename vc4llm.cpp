@@ -1,9 +1,9 @@
 /*
  * VC4LLM: VideoCore IV LLM Inference Engine
- * Phase 1: CPU-Only Foundation (MVP) - Bugfix Release #4
+ * Phase 1: CPU-Only Foundation (MVP) - Bugfix Release #5
  *
  * Target Hardware: Raspberry Pi 3B (Cortex-A53 + VideoCore IV)
- * Current State: GGUF Loader (Fixed Tied Embeddings) + Naive Scalar Inference
+ * Current State: GGUF Loader + Naive Scalar Inference + BPE Decoding
  *
  * Compile: g++ -O3 -std=c++17 -o vc4llm vc4llm.cpp -lpthread
  */
@@ -475,15 +475,115 @@ std::vector<int> tokenize(GGUFModel& model, const std::string& text) {
     return tokens;
 }
 
-std::string detokenize(GGUFModel& model, int id) {
-    if (id < 0 || id >= model.vocab_tokens.size()) return "";
-    std::string s = model.vocab_tokens[id];
-    size_t pos = 0;
-    while ((pos = s.find("\xe2\x96\x81", pos)) != std::string::npos) {
-        s.replace(pos, 3, " ");
-        pos += 1;
+// BPE Decoder Helpers
+std::unordered_map<char32_t, uint8_t> build_byte_decoder() {
+    std::unordered_map<char32_t, uint8_t> decoder;
+    
+    // Printable ASCII (33-126) maps to itself
+    for (int b = 33; b <= 126; b++) {
+        decoder[b] = b;
     }
-    return s;
+    // Extended Latin (161-172, 174-255) maps to itself  
+    for (int b = 161; b <= 172; b++) {
+        decoder[b] = b;
+    }
+    for (int b = 174; b <= 255; b++) {
+        decoder[b] = b;
+    }
+    
+    // Non-printable bytes map to U+0100 + offset
+    int n = 0;
+    for (int b = 0; b < 256; b++) {
+        // Check if already mapped above
+        if ((b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255)) {
+            continue;
+        }
+        // Map U+0100+n back to byte b
+        decoder[256 + n] = b;
+        n++;
+    }
+    
+    return decoder;
+}
+
+// Decode a single UTF-8 character and return its code point
+char32_t decode_utf8_char(const char*& ptr) {
+    uint8_t c = *ptr++;
+    
+    if ((c & 0x80) == 0) {
+        // ASCII (0xxxxxxx)
+        return c;
+    } else if ((c & 0xE0) == 0xC0) {
+        // 2-byte sequence (110xxxxx 10xxxxxx)
+        char32_t cp = (c & 0x1F) << 6;
+        cp |= (*ptr++ & 0x3F);
+        return cp;
+    } else if ((c & 0xF0) == 0xE0) {
+        // 3-byte sequence (1110xxxx 10xxxxxx 10xxxxxx)
+        char32_t cp = (c & 0x0F) << 12;
+        cp |= (*ptr++ & 0x3F) << 6;
+        cp |= (*ptr++ & 0x3F);
+        return cp;
+    } else if ((c & 0xF8) == 0xF0) {
+        // 4-byte sequence (11110xxx 10xxxxxx 10xxxxxx 10xxxxxx)
+        char32_t cp = (c & 0x07) << 18;
+        cp |= (*ptr++ & 0x3F) << 12;
+        cp |= (*ptr++ & 0x3F) << 6;
+        cp |= (*ptr++ & 0x3F);
+        return cp;
+    }
+    
+    return 0xFFFD; // Replacement character for invalid UTF-8
+}
+
+static std::unordered_map<char32_t, uint8_t> g_byte_decoder;
+static bool g_byte_decoder_initialized = false;
+
+std::string detokenize(GGUFModel& model, int id) {
+    if (!g_byte_decoder_initialized) {
+        g_byte_decoder = build_byte_decoder();
+        g_byte_decoder_initialized = true;
+    }
+    
+    if (id < 0 || id >= model.vocab_tokens.size()) return "";
+    
+    const std::string& token = model.vocab_tokens[id];
+    
+    // Skip special tokens
+    if (token == "<s>" || token == "</s>" || 
+        token == "<unk>" || token == "<pad>" ||
+        token == "<|endoftext|>") {
+        return "";
+    }
+
+    std::string result;
+    
+    const char* ptr = token.c_str();
+    const char* end = ptr + token.length();
+    
+    while (ptr < end) {
+        char32_t cp = decode_utf8_char(ptr);
+        
+        auto it = g_byte_decoder.find(cp);
+        if (it != g_byte_decoder.end()) {
+            result += (char)it->second;
+        } else {
+            // Unknown code point - output as UTF-8
+            // (This handles actual Unicode characters in the vocab)
+            if (cp < 0x80) {
+                result += (char)cp;
+            } else if (cp < 0x800) {
+                result += (char)(0xC0 | (cp >> 6));
+                result += (char)(0x80 | (cp & 0x3F));
+            } else if (cp < 0x10000) {
+                result += (char)(0xE0 | (cp >> 12));
+                result += (char)(0x80 | ((cp >> 6) & 0x3F));
+                result += (char)(0x80 | (cp & 0x3F));
+            }
+        }
+    }
+    
+    return result;
 }
 
 // =================================================================================================
