@@ -12,8 +12,13 @@
  * Compile: g++ -O3 -mcpu=cortex-a53 -mfpu=neon-fp-armv8 -mfloat-abi=hard -o vc4llm vc4llm.cpp -lpthread -lOpenCL
  */
 
-#define CL_TARGET_OPENCL_VERSION 120
-#include <CL/cl.h>
+#if __has_include(<CL/cl.h>)
+    #define CL_TARGET_OPENCL_VERSION 120
+    #include <CL/cl.h>
+    #define HAS_OPENCL 1
+#else
+    #define HAS_OPENCL 0
+#endif
 
 #include <iostream>
 #include <fstream>
@@ -239,31 +244,40 @@ private:
 // 3. OpenCL Backend (VC4CL)
 // =================================================================================================
 
+#if HAS_OPENCL
 static cl_context g_cl_context = nullptr;
 static cl_command_queue g_cl_queue = nullptr;
 static cl_program g_cl_program = nullptr;
 static cl_kernel g_cl_kernel_q8_0 = nullptr;
 static bool g_cl_initialized = false;
+#endif
+
 static bool g_use_gpu = false;
 
 struct PerfCounters {
+    #if HAS_OPENCL
     uint64_t gpu_kernel_us = 0;
     uint64_t gpu_transfer_us = 0;
-    uint64_t cpu_compute_us = 0;
     int gpu_calls = 0;
+    #endif
+    uint64_t cpu_compute_us = 0;
     int cpu_calls = 0;
 
     void report() {
         std::cout << "\n=== Performance Breakdown ===" << std::endl;
+        #if HAS_OPENCL
         std::cout << "GPU kernel time: " << gpu_kernel_us / 1000.0 << " ms" << std::endl;
         std::cout << "GPU transfer time: " << gpu_transfer_us / 1000.0 << " ms" << std::endl;
+        std::cout << "GPU calls: " << gpu_calls << std::endl;
+        #endif
         std::cout << "CPU compute time: " << cpu_compute_us / 1000.0 << " ms" << std::endl;
-        std::cout << "GPU calls: " << gpu_calls << ", CPU calls: " << cpu_calls << std::endl;
+        std::cout << "CPU calls: " << cpu_calls << std::endl;
     }
 };
 
 static PerfCounters g_perf;
 
+#if HAS_OPENCL
 // OpenCL Kernel Source
 const char* CL_KERNEL_SRC = R"(
 // FP16 to FP32 conversion (simplified, no denormal handling)
@@ -446,6 +460,7 @@ bool gpu_gemv(float* dst, const float* x, cl_mem w_buf, int m, int k) {
 
     return (err == CL_SUCCESS);
 }
+#endif
 
 // =================================================================================================
 // 4. GGUF Parser
@@ -466,20 +481,26 @@ public:
     std::map<std::string, int> token_to_id;
     int token_bos = 1, token_eos = 2;
 
+    #if HAS_OPENCL
     // Add GPU buffer cache
     std::unordered_map<std::string, cl_mem> gpu_buffers;
+    #endif
 
     ~GGUFModel() {
+        #if HAS_OPENCL
         for (auto& kv : gpu_buffers) {
             clReleaseMemObject(kv.second);
         }
-        if (mapped_data) munmap(mapped_data, mapped_size);
+        gpu_buffers.clear();
+
         if (g_cl_initialized) {
             clReleaseKernel(g_cl_kernel_q8_0);
             clReleaseProgram(g_cl_program);
             clReleaseCommandQueue(g_cl_queue);
             clReleaseContext(g_cl_context);
         }
+        #endif
+        if (mapped_data) munmap(mapped_data, mapped_size);
     }
 
     bool load(const std::string& path, bool verbose = false) {
@@ -558,10 +579,12 @@ public:
 
         discover_names();
 
+        #if HAS_OPENCL
         // After tensors are loaded, upload Q8_0 weights to GPU
         if (g_use_gpu && g_cl_initialized) {
             upload_weights_to_gpu();
         }
+        #endif
 
         return true;
     }
@@ -571,6 +594,7 @@ public:
         return nullptr;
     }
 
+    #if HAS_OPENCL
     void upload_weights_to_gpu() {
         std::cout << "Uploading weights to GPU..." << std::endl;
         for (auto& t : tensors) {
@@ -591,6 +615,7 @@ public:
         }
         std::cout << "Uploaded " << gpu_buffers.size() << " tensors to GPU" << std::endl;
     }
+    #endif
 
 private:
     void discover_names() {
@@ -866,10 +891,13 @@ float vec_dot_q8_0_f32_neon(const void* vb, const float* vx, int n) {
 }
 
 // Tuned thresholds based on VideoCore IV characteristics
+#if HAS_OPENCL
 const int64_t GPU_MIN_OPS = 1024 * 576;  // ~590K ops minimum for GPU
+#endif
 
 // Matrix Multiplication (Hybrid CPU/GPU)
 void mat_vec_mul(float* dst, const float* x, TensorInfo* w, int m, int k, ThreadPool& pool, GGUFModel& model) {
+    #if HAS_OPENCL
     int64_t ops = (int64_t)m * k;
 
     // GPU path: Only for large operations with cached buffers
@@ -884,6 +912,7 @@ void mat_vec_mul(float* dst, const float* x, TensorInfo* w, int m, int k, Thread
         }
         // Fall through to CPU on failure
     }
+    #endif
 
     g_perf.cpu_calls++;
     auto t0 = time_us();
@@ -1065,7 +1094,14 @@ int main(int argc, char** argv) {
         else if (arg == "-n" && i+1 < argc) n_predict = std::stoi(argv[++i]);
         else if (arg == "-t" && i+1 < argc) n_threads = std::stoi(argv[++i]);
         else if (arg == "-v") verbose = true;
-        else if (arg == "-g" || arg == "--gpu") g_use_gpu = true;
+        else if (arg == "-g" || arg == "--gpu") {
+            #if HAS_OPENCL
+            g_use_gpu = true;
+            #else
+            std::cerr << "Warning: --gpu requested but OpenCL not available at compile time.\n";
+            std::cerr << "Rebuild with: g++ ... -lOpenCL\n";
+            #endif
+        }
     }
 
     if (model_path.empty()) {
@@ -1073,12 +1109,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    #if HAS_OPENCL
     if (g_use_gpu) {
         if (!init_opencl()) {
             std::cerr << "Warning: OpenCL initialization failed. Falling back to CPU.\n";
             g_use_gpu = false;
         }
     }
+    #endif
 
     GGUFModel model;
     if (!model.load(model_path, verbose)) return 1;
