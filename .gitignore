@@ -1,0 +1,29 @@
+# Compiled binaries
+vc4llm
+vc4llm_test
+*.o
+*.a
+*.so
+
+# Model files (large)
+*.gguf
+*.bin
+*.safetensors
+
+# Build directories
+build/
+cmake-build-*/
+
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Debug/profiling
+*.log
+core
+core.*
+vgcore.*
