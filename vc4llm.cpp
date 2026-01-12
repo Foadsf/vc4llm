@@ -1,6 +1,6 @@
 /*
  * VC4LLM: VideoCore IV LLM Inference Engine
- * Phase 3: GPU Acceleration (VC4CL OpenCL) - Bugfix Release #2
+ * Phase 3: GPU Acceleration (VC4CL OpenCL) - Optimized
  *
  * Target Hardware: Raspberry Pi 3B (Cortex-A53 + VideoCore IV)
  * Features:
@@ -12,8 +12,13 @@
  * Compile: g++ -O3 -mcpu=cortex-a53 -mfpu=neon-fp-armv8 -mfloat-abi=hard -o vc4llm vc4llm.cpp -lpthread -lOpenCL
  */
 
-#define CL_TARGET_OPENCL_VERSION 120
-#include <CL/cl.h>
+#if __has_include(<CL/cl.h>)
+    #define CL_TARGET_OPENCL_VERSION 120
+    #include <CL/cl.h>
+    #define HAS_OPENCL 1
+#else
+    #define HAS_OPENCL 0
+#endif
 
 #include <iostream>
 #include <fstream>
@@ -168,20 +173,23 @@ T peek_unaligned(const void* ptr) {
 class ThreadPool {
 public:
     ThreadPool(size_t threads) : stop(false) {
-        for(size_t i = 0; i < threads; ++i)
+        for (size_t i = 0; i < threads; ++i) {
             workers.emplace_back([this] {
-                for(;;) {
+                while (true) {
                     std::function<void()> task;
                     {
-                        std::unique_lock<std::mutex> lock(this->queue_mutex);
-                        this->condition.wait(lock, [this]{ return this->stop || !this->tasks.empty(); });
-                        if(this->stop && this->tasks.empty()) return;
-                        task = std::move(this->tasks.front());
-                        this->tasks.pop();
+                        std::unique_lock<std::mutex> lock(queue_mutex);
+                        condition.wait(lock, [this] {
+                            return stop || !tasks.empty();
+                        });
+                        if (stop && tasks.empty()) return;
+                        task = std::move(tasks.front());
+                        tasks.pop();
                     }
                     task();
                 }
             });
+        }
     }
 
     ~ThreadPool() {
@@ -190,38 +198,38 @@ public:
             stop = true;
         }
         condition.notify_all();
-        for(std::thread &worker: workers) worker.join();
+        for (auto& worker : workers) worker.join();
     }
 
+    // Simple, correct parallel_for using spin-wait
     void parallel_for(int start, int end, std::function<void(int, int)> body) {
+        if (start >= end) return;
+
         int n_threads = workers.size();
         int range = end - start;
         int chunk = (range + n_threads - 1) / n_threads;
         
-        std::atomic<int> counter(n_threads);
-        std::condition_variable cv;
-        std::mutex mtx;
+        std::atomic<int> remaining(0);
 
-        for(int t=0; t<n_threads; ++t) {
+        for (int t = 0; t < n_threads && start + t * chunk < end; ++t) {
+            remaining++;
             int t_start = start + t * chunk;
             int t_end = std::min(t_start + chunk, end);
             
-            if (t_start >= end) {
-                counter--;
-                continue;
-            }
-
             {
                 std::unique_lock<std::mutex> lock(queue_mutex);
-                tasks.emplace([=, &body, &counter, &cv] {
+                tasks.emplace([=, &body, &remaining] {
                     body(t_start, t_end);
-                    if (--counter == 0) cv.notify_one();
+                    remaining.fetch_sub(1, std::memory_order_release);
                 });
             }
+            condition.notify_one();
         }
-        condition.notify_all();
-        std::unique_lock<std::mutex> lock(mtx);
-        cv.wait(lock, [&]{ return counter == 0; });
+
+        // Spin-wait (simple, no deadlock possible)
+        while (remaining.load(std::memory_order_acquire) > 0) {
+            std::this_thread::yield();
+        }
     }
 
 private:
@@ -236,64 +244,98 @@ private:
 // 3. OpenCL Backend (VC4CL)
 // =================================================================================================
 
+#if HAS_OPENCL
 static cl_context g_cl_context = nullptr;
 static cl_command_queue g_cl_queue = nullptr;
 static cl_program g_cl_program = nullptr;
 static cl_kernel g_cl_kernel_q8_0 = nullptr;
 static bool g_cl_initialized = false;
+#endif
+
 static bool g_use_gpu = false;
 
-// OpenCL Kernel Source
-// Implements manual FP16->FP32 conversion and uses ARM INT8 dot product extension
-const char* CL_KERNEL_SRC = R"(
-#pragma OPENCL EXTENSION cl_arm_integer_dot_product_int8 : enable
+struct PerfCounters {
+    #if HAS_OPENCL
+    uint64_t gpu_kernel_us = 0;
+    uint64_t gpu_transfer_us = 0;
+    int gpu_calls = 0;
+    #endif
+    uint64_t cpu_compute_us = 0;
+    int cpu_calls = 0;
 
-// Manual FP16 to FP32 conversion (Simplified to avoid clz)
+    void report() {
+        std::cout << "\n=== Performance Breakdown ===" << std::endl;
+        #if HAS_OPENCL
+        std::cout << "GPU kernel time: " << gpu_kernel_us / 1000.0 << " ms" << std::endl;
+        std::cout << "GPU transfer time: " << gpu_transfer_us / 1000.0 << " ms" << std::endl;
+        std::cout << "GPU calls: " << gpu_calls << std::endl;
+        #endif
+        std::cout << "CPU compute time: " << cpu_compute_us / 1000.0 << " ms" << std::endl;
+        std::cout << "CPU calls: " << cpu_calls << std::endl;
+    }
+};
+
+static PerfCounters g_perf;
+
+#if HAS_OPENCL
+// OpenCL Kernel Source
+const char* CL_KERNEL_SRC = R"(
+// FP16 to FP32 conversion (simplified, no denormal handling)
 float f16_to_f32(ushort h) {
     uint s = (h >> 15) & 0x1;
     uint e = (h >> 10) & 0x1F;
     uint m = h & 0x3FF;
-    
-    // Simplification for VC4CL: Treat denormals as zero
     if (e == 0) return 0.0f;
-    
-    // Handle Inf/NaN roughly
-    if (e == 31) return s ? -1.0f/0.0f : 1.0f/0.0f; // Simplified Infinity
-    
+    if (e == 31) return s ? -INFINITY : INFINITY;
     uint val = (s << 31) | ((e + 112) << 23) | (m << 13);
     return as_float(val);
 }
 
-// Fixed Correct Kernel
-__kernel void gemv_q8_0_fixed(
-    __global const uchar* W,
-    __global const float* x,
-    __global float* y,
-    int M, int K
+// Optimized GEMV kernel for Q8_0 weights × F32 input
+// Strategy: Each work item processes one output row
+// Use float4 vectorization where possible
+__kernel void gemv_q8_0_opt(
+    __global const uchar* restrict W,  // Q8_0 weights [M, K/32, 34]
+    __global const float* restrict x,  // Float input [K]
+    __global float* restrict y,        // Output [M]
+    const int M,
+    const int K
 ) {
-    int row = get_global_id(0);
+    const int row = get_global_id(0);
     if (row >= M) return;
     
-    int num_blocks = K / 32;
+    const int num_blocks = K >> 5;  // K / 32
     float total = 0.0f;
     
-    __global const uchar* w_row = W + row * num_blocks * 34;
+    // Pointer to this row's weights
+    __global const uchar* w_ptr = W + row * num_blocks * 34;
     
     for (int b = 0; b < num_blocks; b++) {
-        ushort d_f16 = *((__global const ushort*)(w_row));
-        float d = f16_to_f32(d_f16);
-        __global const char* qs = (__global const char*)(w_row + 2);
+        // Load scale
+        const float d = f16_to_f32(*(__global const ushort*)w_ptr);
+        __global const char* qs = (__global const char*)(w_ptr + 2);
         
-        float block_sum = 0.0f;
+        // Vectorized accumulation using float4
+        // Process 32 elements as 8 × float4
+        float4 sum4 = (float4)(0.0f);
+
+        __global const float* x_ptr = x + (b << 5);  // b * 32
+
+        // Unroll 8 iterations of 4 elements each
         for (int j = 0; j < 32; j += 4) {
             char4 w4 = vload4(0, qs + j);
-            float4 x4 = vload4(0, x + b*32 + j);
+            float4 x4 = vload4(0, x_ptr + j);
             float4 w_f = convert_float4(w4);
-            block_sum += dot(w_f, x4);
+            sum4 = mad(w_f, x4, sum4);  // fused multiply-add
         }
+
+        // Horizontal sum of float4
+        float block_sum = sum4.x + sum4.y + sum4.z + sum4.w;
         total += block_sum * d;
-        w_row += 34;
+
+        w_ptr += 34;
     }
+
     y[row] = total;
 }
 )";
@@ -323,10 +365,22 @@ bool init_opencl() {
     g_cl_queue = clCreateCommandQueue(g_cl_context, device, 0, &err);
     if (!g_cl_queue) return false;
     
+    // Check for required extensions
+    char extensions[4096];
+    clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, sizeof(extensions), extensions, NULL);
+
+    bool has_int8_dot = (strstr(extensions, "cl_arm_integer_dot_product_int8") != nullptr);
+    std::cout << "INT8 dot product: " << (has_int8_dot ? "YES" : "NO") << std::endl;
+
+    // Compile with appropriate options
+    const char* build_opts = has_int8_dot ?
+        "-cl-fast-relaxed-math -DUSE_INT8_DOT=1" :
+        "-cl-fast-relaxed-math -DUSE_INT8_DOT=0";
+
     // Compile program
     const char* src_ptr = CL_KERNEL_SRC;
     g_cl_program = clCreateProgramWithSource(g_cl_context, 1, &src_ptr, NULL, &err);
-    if (clBuildProgram(g_cl_program, 1, &device, NULL, NULL, NULL) != CL_SUCCESS) {
+    if (clBuildProgram(g_cl_program, 1, &device, build_opts, NULL, NULL) != CL_SUCCESS) {
         size_t len;
         clGetProgramBuildInfo(g_cl_program, device, CL_PROGRAM_BUILD_LOG, 0, NULL, &len);
         std::vector<char> log(len);
@@ -335,12 +389,78 @@ bool init_opencl() {
         return false;
     }
     
-    g_cl_kernel_q8_0 = clCreateKernel(g_cl_program, "gemv_q8_0_fixed", &err);
+    g_cl_kernel_q8_0 = clCreateKernel(g_cl_program, "gemv_q8_0_opt", &err);
     if (err != CL_SUCCESS) return false;
     
     g_cl_initialized = true;
     return true;
 }
+
+bool gpu_gemv(float* dst, const float* x, cl_mem w_buf, int m, int k) {
+    cl_int err;
+    auto t0 = time_us();
+
+    // Reusable input buffer (create once, resize if needed)
+    static cl_mem x_buf = nullptr;
+    static cl_mem y_buf = nullptr;
+    static int x_buf_size = 0;
+    static int y_buf_size = 0;
+
+    // Resize input buffer if needed
+    if (k * sizeof(float) > x_buf_size) {
+        if (x_buf) clReleaseMemObject(x_buf);
+        x_buf = clCreateBuffer(g_cl_context, CL_MEM_READ_ONLY,
+                               k * sizeof(float), NULL, &err);
+        x_buf_size = k * sizeof(float);
+    }
+
+    // Resize output buffer if needed
+    if (m * sizeof(float) > y_buf_size) {
+        if (y_buf) clReleaseMemObject(y_buf);
+        y_buf = clCreateBuffer(g_cl_context, CL_MEM_WRITE_ONLY,
+                               m * sizeof(float), NULL, &err);
+        y_buf_size = m * sizeof(float);
+    }
+
+    auto t1 = time_us();
+    g_perf.gpu_transfer_us += (t1 - t0);
+
+    // Async write input
+    err = clEnqueueWriteBuffer(g_cl_queue, x_buf, CL_FALSE, 0,
+                               k * sizeof(float), x, 0, NULL, NULL);
+    if (err != CL_SUCCESS) return false;
+
+    auto t2 = time_us();
+    g_perf.gpu_transfer_us += (t2 - t1);
+
+    // Set kernel args
+    clSetKernelArg(g_cl_kernel_q8_0, 0, sizeof(cl_mem), &w_buf);
+    clSetKernelArg(g_cl_kernel_q8_0, 1, sizeof(cl_mem), &x_buf);
+    clSetKernelArg(g_cl_kernel_q8_0, 2, sizeof(cl_mem), &y_buf);
+    clSetKernelArg(g_cl_kernel_q8_0, 3, sizeof(int), &m);
+    clSetKernelArg(g_cl_kernel_q8_0, 4, sizeof(int), &k);
+
+    // Launch kernel
+    size_t global_size = m;
+    size_t local_size = std::min(12, m);  // VC4CL max is 12
+
+    err = clEnqueueNDRangeKernel(g_cl_queue, g_cl_kernel_q8_0, 1, NULL,
+                                  &global_size, &local_size, 0, NULL, NULL);
+    if (err != CL_SUCCESS) return false;
+
+    auto t3 = time_us();
+    g_perf.gpu_kernel_us += (t3 - t2);
+
+    // Blocking read output
+    err = clEnqueueReadBuffer(g_cl_queue, y_buf, CL_TRUE, 0,
+                              m * sizeof(float), dst, 0, NULL, NULL);
+
+    auto t4 = time_us();
+    g_perf.gpu_transfer_us += (t4 - t3);
+
+    return (err == CL_SUCCESS);
+}
+#endif
 
 // =================================================================================================
 // 4. GGUF Parser
@@ -361,14 +481,26 @@ public:
     std::map<std::string, int> token_to_id;
     int token_bos = 1, token_eos = 2;
 
+    #if HAS_OPENCL
+    // Add GPU buffer cache
+    std::unordered_map<std::string, cl_mem> gpu_buffers;
+    #endif
+
     ~GGUFModel() {
-        if (mapped_data) munmap(mapped_data, mapped_size);
+        #if HAS_OPENCL
+        for (auto& kv : gpu_buffers) {
+            clReleaseMemObject(kv.second);
+        }
+        gpu_buffers.clear();
+
         if (g_cl_initialized) {
             clReleaseKernel(g_cl_kernel_q8_0);
             clReleaseProgram(g_cl_program);
             clReleaseCommandQueue(g_cl_queue);
             clReleaseContext(g_cl_context);
         }
+        #endif
+        if (mapped_data) munmap(mapped_data, mapped_size);
     }
 
     bool load(const std::string& path, bool verbose = false) {
@@ -446,6 +578,14 @@ public:
         }
 
         discover_names();
+
+        #if HAS_OPENCL
+        // After tensors are loaded, upload Q8_0 weights to GPU
+        if (g_use_gpu && g_cl_initialized) {
+            upload_weights_to_gpu();
+        }
+        #endif
+
         return true;
     }
 
@@ -453,6 +593,29 @@ public:
         if (tensor_map.find(name) != tensor_map.end()) return tensor_map[name];
         return nullptr;
     }
+
+    #if HAS_OPENCL
+    void upload_weights_to_gpu() {
+        std::cout << "Uploading weights to GPU..." << std::endl;
+        for (auto& t : tensors) {
+            if (t.type == GGML_TYPE_Q8_0) {
+                cl_int err;
+                // USE_HOST_PTR for zero-copy from mmap
+                cl_mem buf = clCreateBuffer(
+                    g_cl_context,
+                    CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
+                    t.size_bytes(),
+                    t.data,
+                    &err
+                );
+                if (err == CL_SUCCESS) {
+                    gpu_buffers[t.name] = buf;
+                }
+            }
+        }
+        std::cout << "Uploaded " << gpu_buffers.size() << " tensors to GPU" << std::endl;
+    }
+    #endif
 
 private:
     void discover_names() {
@@ -727,43 +890,32 @@ float vec_dot_q8_0_f32_neon(const void* vb, const float* vx, int n) {
 #endif
 }
 
+// Tuned thresholds based on VideoCore IV characteristics
+#if HAS_OPENCL
+const int64_t GPU_MIN_OPS = 1024 * 576;  // ~590K ops minimum for GPU
+#endif
+
 // Matrix Multiplication (Hybrid CPU/GPU)
-void mat_vec_mul(float* dst, const float* x, TensorInfo* w, int m, int k, ThreadPool& pool) {
-    // GPU Path (if enabled and large enough)
-    if (g_use_gpu && g_cl_initialized && w->type == GGML_TYPE_Q8_0 && m * k >= 256 * 256) {
-        cl_int err;
+void mat_vec_mul(float* dst, const float* x, TensorInfo* w, int m, int k, ThreadPool& pool, GGUFModel& model) {
+    #if HAS_OPENCL
+    int64_t ops = (int64_t)m * k;
+
+    // GPU path: Only for large operations with cached buffers
+    if (g_use_gpu && g_cl_initialized &&
+        w->type == GGML_TYPE_Q8_0 &&
+        model.gpu_buffers.count(w->name) &&
+        ops >= GPU_MIN_OPS) {
         
-        // Zero-copy input buffer
-        cl_mem d_x = clCreateBuffer(g_cl_context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, k * sizeof(float), (void*)x, &err);
-        
-        // Zero-copy weights (directly from mmap)
-        cl_mem d_w = clCreateBuffer(g_cl_context, CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR, w->size_bytes(), w->data, &err);
-        
-        // Output buffer
-        cl_mem d_y = clCreateBuffer(g_cl_context, CL_MEM_WRITE_ONLY, m * sizeof(float), NULL, &err);
-        
-        if (d_x && d_w && d_y) {
-            clSetKernelArg(g_cl_kernel_q8_0, 0, sizeof(cl_mem), &d_w);
-            clSetKernelArg(g_cl_kernel_q8_0, 1, sizeof(cl_mem), &d_x);
-            clSetKernelArg(g_cl_kernel_q8_0, 2, sizeof(cl_mem), &d_y);
-            clSetKernelArg(g_cl_kernel_q8_0, 3, sizeof(int), &m);
-            clSetKernelArg(g_cl_kernel_q8_0, 4, sizeof(int), &k);
-            
-            size_t global_work_size = m;
-            // VC4CL max workgroup size 12, usually safer to let driver decide (NULL) or use small multiple
-            err = clEnqueueNDRangeKernel(g_cl_queue, g_cl_kernel_q8_0, 1, NULL, &global_work_size, NULL, 0, NULL, NULL);
-            
-            if (err == CL_SUCCESS) {
-                clEnqueueReadBuffer(g_cl_queue, d_y, CL_TRUE, 0, m * sizeof(float), dst, 0, NULL, NULL);
-                clReleaseMemObject(d_x); clReleaseMemObject(d_w); clReleaseMemObject(d_y);
-                return; // GPU Done
-            }
+        g_perf.gpu_calls++;
+        if (gpu_gemv(dst, x, model.gpu_buffers[w->name], m, k)) {
+            return;  // GPU succeeded
         }
-        // Fallback cleanup if failed
-        if(d_x) clReleaseMemObject(d_x);
-        if(d_w) clReleaseMemObject(d_w);
-        if(d_y) clReleaseMemObject(d_y);
+        // Fall through to CPU on failure
     }
+    #endif
+
+    g_perf.cpu_calls++;
+    auto t0 = time_us();
 
     // CPU Path (NEON Parallel)
     pool.parallel_for(0, m, [&](int start, int end) {
@@ -792,6 +944,9 @@ void mat_vec_mul(float* dst, const float* x, TensorInfo* w, int m, int k, Thread
             dst[row] = sum;
         }
     });
+
+    auto t1 = time_us();
+    g_perf.cpu_compute_us += (t1 - t0);
 }
 
 // =================================================================================================
@@ -851,9 +1006,9 @@ void inference(GGUFModel& model, const std::vector<int>& input_tokens, int n_pre
             
             rms_norm(state.xb.data(), state.x.data(), get_tensor_or_fail(model, layer_prefix + naming.attn_norm), dim, cfg.rms_norm_eps);
             
-            mat_vec_mul(state.q.data(), state.xb.data(), get_tensor_or_fail(model, layer_prefix + naming.attn_q), cfg.n_head * head_dim, dim, pool);
-            mat_vec_mul(state.k.data(), state.xb.data(), get_tensor_or_fail(model, layer_prefix + naming.attn_k), cfg.n_head_kv * head_dim, dim, pool);
-            mat_vec_mul(state.v.data(), state.xb.data(), get_tensor_or_fail(model, layer_prefix + naming.attn_v), cfg.n_head_kv * head_dim, dim, pool);
+            mat_vec_mul(state.q.data(), state.xb.data(), get_tensor_or_fail(model, layer_prefix + naming.attn_q), cfg.n_head * head_dim, dim, pool, model);
+            mat_vec_mul(state.k.data(), state.xb.data(), get_tensor_or_fail(model, layer_prefix + naming.attn_k), cfg.n_head_kv * head_dim, dim, pool, model);
+            mat_vec_mul(state.v.data(), state.xb.data(), get_tensor_or_fail(model, layer_prefix + naming.attn_v), cfg.n_head_kv * head_dim, dim, pool, model);
             
             rope(state.q.data(), cfg.n_head * head_dim, cfg.n_head, pos, cfg.rope_freq_base);
             rope(state.k.data(), cfg.n_head_kv * head_dim, cfg.n_head_kv, pos, cfg.rope_freq_base);
@@ -888,27 +1043,26 @@ void inference(GGUFModel& model, const std::vector<int>& input_tokens, int n_pre
                 }
             }
             
-            // Fixed: removed the duplicate/incorrect overwriting mat_vec_mul call here
             std::vector<float> attn_out(dim);
-            mat_vec_mul(attn_out.data(), state.xb.data(), get_tensor_or_fail(model, layer_prefix + naming.attn_out), dim, dim, pool);
+            mat_vec_mul(attn_out.data(), state.xb.data(), get_tensor_or_fail(model, layer_prefix + naming.attn_out), dim, dim, pool, model);
             vec_add(state.x.data(), state.x.data(), attn_out.data(), dim);
 
             rms_norm(state.xb.data(), state.x.data(), get_tensor_or_fail(model, layer_prefix + naming.ffn_norm), dim, cfg.rms_norm_eps);
             
-            mat_vec_mul(state.hb.data(), state.xb.data(), get_tensor_or_fail(model, layer_prefix + naming.ffn_gate), hidden_dim, dim, pool);
+            mat_vec_mul(state.hb.data(), state.xb.data(), get_tensor_or_fail(model, layer_prefix + naming.ffn_gate), hidden_dim, dim, pool, model);
             std::vector<float> h_up(hidden_dim);
-            mat_vec_mul(h_up.data(), state.xb.data(), get_tensor_or_fail(model, layer_prefix + naming.ffn_up), hidden_dim, dim, pool);
+            mat_vec_mul(h_up.data(), state.xb.data(), get_tensor_or_fail(model, layer_prefix + naming.ffn_up), hidden_dim, dim, pool, model);
             
             silu(state.hb.data(), hidden_dim);
             vec_mul(state.hb.data(), state.hb.data(), h_up.data(), hidden_dim);
             
             std::vector<float> ffn_out(dim);
-            mat_vec_mul(ffn_out.data(), state.hb.data(), get_tensor_or_fail(model, layer_prefix + naming.ffn_down), dim, hidden_dim, pool);
+            mat_vec_mul(ffn_out.data(), state.hb.data(), get_tensor_or_fail(model, layer_prefix + naming.ffn_down), dim, hidden_dim, pool, model);
             vec_add(state.x.data(), state.x.data(), ffn_out.data(), dim);
         }
 
         rms_norm(state.x.data(), state.x.data(), get_tensor_or_fail(model, naming.output_norm), dim, cfg.rms_norm_eps);
-        mat_vec_mul(state.logits.data(), state.x.data(), get_tensor_or_fail(model, naming.output), cfg.vocab_size, dim, pool);
+        mat_vec_mul(state.logits.data(), state.x.data(), get_tensor_or_fail(model, naming.output), cfg.vocab_size, dim, pool, model);
         
         int best_token = 0; float max_logit = state.logits[0];
         for(int i=1; i<cfg.vocab_size; ++i) { if (state.logits[i] > max_logit) { max_logit = state.logits[i]; best_token = i; } }
@@ -917,13 +1071,18 @@ void inference(GGUFModel& model, const std::vector<int>& input_tokens, int n_pre
         n_processed++; pos++;
     }
     std::cout << "\n";
+    g_perf.report();
 }
 
 // =================================================================================================
 // 8. Main CLI
 // =================================================================================================
 
+#ifdef VC4LLM_TEST
+int run_inference_cli(int argc, char** argv) {
+#else
 int main(int argc, char** argv) {
+#endif
     std::string model_path, prompt = "Hello world";
     int n_predict = 20, n_threads = 4;
     bool verbose = false;
@@ -935,7 +1094,14 @@ int main(int argc, char** argv) {
         else if (arg == "-n" && i+1 < argc) n_predict = std::stoi(argv[++i]);
         else if (arg == "-t" && i+1 < argc) n_threads = std::stoi(argv[++i]);
         else if (arg == "-v") verbose = true;
-        else if (arg == "-g" || arg == "--gpu") g_use_gpu = true;
+        else if (arg == "-g" || arg == "--gpu") {
+            #if HAS_OPENCL
+            g_use_gpu = true;
+            #else
+            std::cerr << "Warning: --gpu requested but OpenCL not available at compile time.\n";
+            std::cerr << "Rebuild with: g++ ... -lOpenCL\n";
+            #endif
+        }
     }
 
     if (model_path.empty()) {
@@ -943,12 +1109,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    #if HAS_OPENCL
     if (g_use_gpu) {
         if (!init_opencl()) {
             std::cerr << "Warning: OpenCL initialization failed. Falling back to CPU.\n";
             g_use_gpu = false;
         }
     }
+    #endif
 
     GGUFModel model;
     if (!model.load(model_path, verbose)) return 1;
